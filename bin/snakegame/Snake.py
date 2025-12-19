@@ -1,281 +1,508 @@
+# save as multi_snake_dqn.py
 import pygame
 import random
 import numpy as np
-from collections import deque
+from collections import deque, namedtuple
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import time
+import math
+import os
 
-# --- 設定參數 ---
+# ----------------- Hyperparams -----------------
 BLOCK_SIZE = 20
-SPEED = 50  # 訓練時可以調高這個數字 (例如 200) 加快速度
-# 顏色定義
-WHITE = (255, 255, 255)
-RED = (200, 0, 0)
-BLUE1 = (0, 0, 255)
-BLUE2 = (0, 100, 255)
-BLACK = (0, 0, 0)
+SPEED = 60          
+WINDOW_W = 640
+WINDOW_H = 480
 
-# --- 遊戲環境 (Environment) ---
-class SnakeGameAI:
-    def __init__(self, w=640, h=480):
+GAME_DURATION = 200  # 遊戲時間 5 分鐘 (秒)
+
+GAMMA = 0.99
+LR = 1e-3
+BATCH_SIZE = 128
+MEMORY_SIZE = 20000
+TARGET_UPDATE_FREQ = 1000   
+TRAIN_START = 500          
+TRAIN_EVERY = 4
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 10000          
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+
+# ----------------- 環境 (含復活機制) -----------------
+class MultiSnakeGameAI:
+    def __init__(self, w=WINDOW_W, h=WINDOW_H, render=True):
         self.w = w
         self.h = h
-        # 初始化 Pygame
-        pygame.init()
-        self.display = pygame.display.set_mode((self.w, self.h))
-        pygame.display.set_caption('Snake Q-Learning')
-        self.clock = pygame.time.Clock()
-        self.reset()
+        self.render = render
+        if self.render:
+            pygame.init()
+            self.display = pygame.display.set_mode((self.w, self.h))
+            pygame.display.set_caption('Snake DQN: Dual Agent (S2 Blocks to Grow)')
+            self.font = pygame.font.SysFont('arial', 20)
+            self.clock = pygame.time.Clock()
+        self.reset_all()
 
-    def reset(self):
-        # 初始化遊戲狀態
-        self.direction = 1  # 0: Left, 1: Right, 2: Up, 3: Down
+    def reset_all(self):
+        """重置整個遊戲局，包含分數"""
+        self.score1 = 0
+        self.score2 = 0
+        self.respawn(1)
+        self.respawn(2)
         
-        self.head = [self.w/2, self.h/2]
-        self.snake = [self.head, 
-                      [self.head[0]-BLOCK_SIZE, self.head[1]],
-                      [self.head[0]-(2*BLOCK_SIZE), self.head[1]]]
-        
-        self.score = 0
         self.food = None
         self._place_food()
         self.frame_iteration = 0
-        return self.get_state()
+        self.start_time = time.time()
+        
+        return self.get_state(1), self.get_state(2)
+
+    def respawn(self, snake_id):
+        """
+        讓特定的蛇復活 (重置位置與長度)，保留分數
+        """
+        if snake_id == 1:
+            self.direction1 = 1 # Right
+            self.head1 = [self.w//4, self.h//2]
+            self.snake1 = [list(self.head1),
+                           [self.head1[0]-BLOCK_SIZE, self.head1[1]],
+                           [self.head1[0]-2*BLOCK_SIZE, self.head1[1]]]
+        else:
+            self.direction2 = 0 # Left
+            self.head2 = [3*self.w//4, self.h//2]
+            self.snake2 = [list(self.head2),
+                           [self.head2[0]+BLOCK_SIZE, self.head2[1]],
+                           [self.head2[0]+2*BLOCK_SIZE, self.head2[1]]]
 
     def _place_food(self):
-        x = random.randint(0, (self.w-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        y = random.randint(0, (self.h-BLOCK_SIZE )//BLOCK_SIZE )*BLOCK_SIZE
-        self.food = [x, y]
-        if self.food in self.snake:
-            self._place_food()
+        while True:
+            x = random.randint(0, (self.w-BLOCK_SIZE)//BLOCK_SIZE )*BLOCK_SIZE
+            y = random.randint(0, (self.h-BLOCK_SIZE)//BLOCK_SIZE )*BLOCK_SIZE
+            candidate = [x,y]
+            if candidate not in self.snake1 and candidate not in self.snake2:
+                self.food = candidate
+                break
 
-    def play_step(self, action):
+    def play_step(self, action1_idx, action2_idx):
+        """
+        回傳: state1, state2, reward1, reward2, dead1, dead2
+        """
         self.frame_iteration += 1
-        # 1. 處理使用者輸入 (允許隨時退出)
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                quit()
-
-        # 2. 移動
-        self._move(action)
-        self.snake.insert(0, list(self.head))
         
-        # 3. 檢查遊戲結束
-        reward = 0
-        game_over = False
-        
-        # 如果撞牆、撞自己、或者在原地繞太久(防呆)
-        if self.is_collision() or self.frame_iteration > 100*len(self.snake):
-            game_over = True
-            reward = -10  # 死亡懲罰
-            return reward, game_over, self.score
+        # 處理 pygame 事件
+        if self.render:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    quit()
 
-        # 4. 放置新食物或移動尾巴
-        if self.head == self.food:
-            self.score += 1
-            reward = 10   # 吃到蘋果獎勵
+        # 1) 計算兩蛇的新方向與 new heads
+        next_head1 = self._calc_next_head(action1_idx, 1)
+        next_head2 = self._calc_next_head(action2_idx, 2)
+        
+        # === 偵測 Snake 1 是否撞上 Snake 2 的身體 (用於獎勵 S2) ===
+        snake2_obstacle_body = self.snake2[:-1] if len(self.snake2) > 0 else [] 
+
+        # 檢查 Snake 1 的下一顆頭是否撞上 Snake 2 的身體
+        snake1_hit_snake2_body = next_head1 in snake2_obstacle_body
+        # =========================================================================
+
+        # 2) 檢查碰撞 (死亡判定)
+        c1 = self._will_collision(next_head1, snake_id=1, next_head_other=next_head2)
+        c2 = self._will_collision(next_head2, snake_id=2, next_head_other=next_head1)
+        
+        # 額外判斷是否為頭對頭碰撞 (用於 S2 獲勝規則)
+        head_on_crash = (next_head1 == next_head2) 
+
+        reward1 = 0.0
+        reward2 = 0.0
+        dead1 = False
+        dead2 = False
+
+        # 3) 處理死亡與復活
+        if c1 or c2:
+            if c1 and c2: # 雙死
+                if head_on_crash:
+                    # 🎯 S2 頭對頭獲勝邏輯
+                    reward1 = -100.0  # S1 強烈懲罰
+                    reward2 = 100.0    # S2 獲得獎勵
+                    self.score2 += 1  # S2 分數增加 (體現頭對頭勝利)
+                else:
+                    # 雙方撞到身體，或撞到牆/自己導致的雙死
+                    reward1 = -10.0
+                    reward2 = -10.0
+                
+                dead1 = True
+                dead2 = True
+                self.respawn(1)
+                self.respawn(2)
+                
+            elif c1: # 只有 1 死
+                reward1 = -10.0
+                dead1 = True
+                self.respawn(1)
+                
+                # === 🎯 獎勵 Snake 2：如果 Snake 1 撞上 S2 身體，給予獎勵 ===
+                if snake1_hit_snake2_body:
+                    reward2 = 100.0   # 高獎勵，鼓勵阻擋行為
+                    reward1 = -100.0  # S1 受到更大的懲罰
+                    self.score2 += 1  # 阻擋成功，Snake 2 加分
+                else:
+                    reward2 = 5.0     # 原本的對手死亡獎勵
+                # =================================================================
+                
+            elif c2: # 只有 2 死
+                reward2 = -10.0
+                reward1 = 5.0
+                dead2 = True
+                self.respawn(2)
+
+        # 4) 移動處理 (如果沒有死才移動)
+        if not dead1:
+            self.snake1.insert(0, list(next_head1))
+            self.head1 = list(next_head1)
+        
+        if not dead2:
+            self.snake2.insert(0, list(next_head2))
+            self.head2 = list(next_head2)
+
+        # 5) 吃食物 與 身體長度處理 
+        ate1 = False
+        ate2 = False
+        
+        if not dead1 and self.head1 == self.food:
+            ate1 = True
+        if not dead2 and self.head2 == self.food:
+            ate2 = True
+
+        # --- 處理 Snake 1 (正常邏輯：吃食物變長) ---
+        if ate1:
+            reward1 = 100.0 # S1 吃食物給高獎勵
+            reward2 = -100.0 # S1 吃食物給 S2 高懲罰 (競爭目標)
+            self.score1 += 1
             self._place_food()
+            # Snake 1 吃到食物，不執行 pop() -> 變長
         else:
-            self.snake.pop()
-        
-        # 5. 更新 UI
-        self._update_ui()
-        self.clock.tick(SPEED)
-        
-        return reward, game_over, self.score
+            if not dead1: 
+                self.snake1.pop() # 沒吃，正常縮尾巴
 
-    def is_collision(self, pt=None):
-        if pt is None:
-            pt = self.head
-        # 撞牆
-        if pt[0] > self.w - BLOCK_SIZE or pt[0] < 0 or pt[1] > self.h - BLOCK_SIZE or pt[1] < 0:
+        
+       
+        
+        if not dead2:
+            # 判斷 S2 是否應該變長 (在 head_on_crash 中 S2 雖然死但馬上復活，這裡無需考慮長度)
+            # 這裡只處理 body block 導致的變長 (S1 dead1=True, S2 alive)
+            
+            # 只有在 S1 撞到 S2 身體的情況下，S2 才會變長 (由 snake1_hit_snake2_body 判斷)
+            if snake1_hit_snake2_body:
+                # 阻擋成功！不執行 pop() -> 變長
+                pass 
+            else:
+                # 沒阻擋成功 (包括吃到食物的情況)，強制 pop()
+                # 頭對頭情況下，S2 雖然得分，但已 respawn，不在此處處理長度變動
+                self.snake2.pop()
+
+        # 6) Reward Shaping (距離獎勵)
+        if not dead1:
+            reward1 += 0.01
+            
+        if not dead2:
+            reward2 += 0.01
+
+        # 畫面更新
+        if self.render:
+            self._update_ui()
+            self.clock.tick(SPEED)
+
+        return self.get_state(1), self.get_state(2), reward1, reward2, dead1, dead2
+    
+    def _calc_next_head(self, action_idx, snake_id):
+        if snake_id == 1:
+            curr_dir = self.direction1
+            head = self.head1[:]
+        else:
+            curr_dir = self.direction2
+            head = self.head2[:]
+
+        clock_wise = [1, 3, 0, 2] # R, D, L, U
+        idx = clock_wise.index(curr_dir)
+        
+        if action_idx == 0:   # straight
+            new_dir = clock_wise[idx]
+        elif action_idx == 1: # right turn
+            next_idx = (idx + 1) % 4
+            new_dir = clock_wise[next_idx]
+        else:                 # left turn
+            next_idx = (idx - 1) % 4
+            new_dir = clock_wise[next_idx]
+
+        if snake_id == 1: self.direction1 = new_dir
+        else: self.direction2 = new_dir
+
+        x, y = head[0], head[1]
+        if new_dir == 1: x += BLOCK_SIZE
+        elif new_dir == 0: x -= BLOCK_SIZE
+        elif new_dir == 3: y += BLOCK_SIZE
+        elif new_dir == 2: y -= BLOCK_SIZE
+
+        return [x, y]
+
+    def _will_collision(self, next_head, snake_id, next_head_other=None):
+        # 1. 撞牆
+        if next_head[0] > self.w - BLOCK_SIZE or next_head[0] < 0 or next_head[1] > self.h - BLOCK_SIZE or next_head[1] < 0:
             return True
-        # 撞身體
-        if pt in self.snake[1:]:
+
+        # 2. 準備身體障礙物
+        if snake_id == 1:
+            self_body = self.snake1[:-1] if len(self.snake1) > 0 else []
+            other_body = self.snake2[:-1] if len(self.snake2) > 0 else []
+        else:
+            self_body = self.snake2[:-1] if len(self.snake2) > 0 else []
+            other_body = self.snake1[:-1] if len(self.snake1) > 0 else []
+
+        obstacles = self_body + other_body
+
+        # 3. 撞到頭 (Head-on)
+        if next_head_other is not None and next_head == next_head_other:
+            # 修正: 移除此處的 reward/score 邏輯，交給 play_step 處理
             return True
+
+        if next_head in obstacles:
+            return True
+            
         return False
 
-    def _update_ui(self):
-        self.display.fill(BLACK)
-        for pt in self.snake:
-            pygame.draw.rect(self.display, BLUE1, pygame.Rect(pt[0], pt[1], BLOCK_SIZE, BLOCK_SIZE))
-            pygame.draw.rect(self.display, BLUE2, pygame.Rect(pt[0]+4, pt[1]+4, 12, 12))
-        
-        pygame.draw.rect(self.display, RED, pygame.Rect(self.food[0], self.food[1], BLOCK_SIZE, BLOCK_SIZE))
-        
-        text = pygame.font.SysFont('arial', 25).render("Score: " + str(self.score), True, WHITE)
-        self.display.blit(text, [0, 0])
-        pygame.display.flip()
+    def get_state(self, snake_id):
+        if snake_id == 1:
+            head = self.snake1[0]
+            direction = self.direction1
+        else:
+            head = self.snake2[0]
+            direction = self.direction2
 
-    def _move(self, action):
-        # action 是相對動作: [直走, 右轉, 左轉]
-        # clock_wise = [Right, Down, Left, Up]
-        clock_wise = [1, 3, 0, 2] 
-        idx = clock_wise.index(self.direction)
-
-        if np.array_equal(action, [1, 0, 0]):
-            new_dir = clock_wise[idx] # 直走
-        elif np.array_equal(action, [0, 1, 0]):
-            next_idx = (idx + 1) % 4
-            new_dir = clock_wise[next_idx] # 右轉
-        else: # [0, 0, 1]
-            next_idx = (idx - 1) % 4
-            new_dir = clock_wise[next_idx] # 左轉
-
-        self.direction = new_dir
-
-        x = self.head[0]
-        y = self.head[1]
-        if self.direction == 1: # Right
-            x += BLOCK_SIZE
-        elif self.direction == 0: # Left
-            x -= BLOCK_SIZE
-        elif self.direction == 3: # Down
-            y += BLOCK_SIZE
-        elif self.direction == 2: # Up
-            y -= BLOCK_SIZE
-            
-        self.head = [x, y]
-    
-    # --- 獲取狀態 (State) ---
-    # 這是 AI 的眼睛，將複雜畫面簡化成 11 個布林值
-    def get_state(self):
-        head = self.snake[0]
-        
-        # 建立四個方向的測試點
         point_l = [head[0] - BLOCK_SIZE, head[1]]
         point_r = [head[0] + BLOCK_SIZE, head[1]]
         point_u = [head[0], head[1] - BLOCK_SIZE]
         point_d = [head[0], head[1] + BLOCK_SIZE]
-        
-        # 當前方向
-        dir_l = self.direction == 0
-        dir_r = self.direction == 1
-        dir_u = self.direction == 2
-        dir_d = self.direction == 3
+
+        dir_l = (direction == 0)
+        dir_r = (direction == 1)
+        dir_u = (direction == 2)
+        dir_d = (direction == 3)
 
         state = [
-            # 1. 前方有危險
-            (dir_r and self.is_collision(point_r)) or 
-            (dir_l and self.is_collision(point_l)) or 
-            (dir_u and self.is_collision(point_u)) or 
-            (dir_d and self.is_collision(point_d)),
+            # Danger Straight
+            (dir_r and self._will_collision(point_r, snake_id)) or 
+            (dir_l and self._will_collision(point_l, snake_id)) or 
+            (dir_u and self._will_collision(point_u, snake_id)) or 
+            (dir_d and self._will_collision(point_d, snake_id)),
 
-            # 2. 右邊有危險
-            (dir_u and self.is_collision(point_r)) or 
-            (dir_d and self.is_collision(point_l)) or 
-            (dir_l and self.is_collision(point_u)) or 
-            (dir_r and self.is_collision(point_d)),
+            # Danger Right
+            (dir_u and self._will_collision(point_r, snake_id)) or 
+            (dir_d and self._will_collision(point_l, snake_id)) or 
+            (dir_l and self._will_collision(point_u, snake_id)) or 
+            (dir_r and self._will_collision(point_d, snake_id)),
 
-            # 3. 左邊有危險
-            (dir_d and self.is_collision(point_r)) or 
-            (dir_u and self.is_collision(point_l)) or 
-            (dir_r and self.is_collision(point_u)) or 
-            (dir_l and self.is_collision(point_d)),
-            
-            # 4. 移動方向
+            # Danger Left
+            (dir_d and self._will_collision(point_r, snake_id)) or 
+            (dir_u and self._will_collision(point_l, snake_id)) or 
+            (dir_r and self._will_collision(point_u, snake_id)) or 
+            (dir_l and self._will_collision(point_d, snake_id)),
+
             dir_l, dir_r, dir_u, dir_d,
-            
-            # 5. 食物位置
-            self.food[0] < head[0],  # 食物在左
-            self.food[0] > head[0],  # 食物在右
-            self.food[1] < head[1],  # 食物在上
-            self.food[1] > head[1]   # 食物在下
+
+            self.food[0] < head[0], # Food Left
+            self.food[0] > head[0], # Food Right
+            self.food[1] < head[1], # Food Up
+            self.food[1] > head[1]  # Food Down
         ]
-        
-        # 將布林轉為 0 或 1
-        return np.array(state, dtype=int)
+        return np.array(state, dtype=np.int32)
 
-# --- Q-Learning Agent ---
+    def _manhattan(self, a, b):
+        return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+    def _update_ui(self):
+        self.display.fill((0,0,0))
+        
+        # Draw Snake 1 (Blue)
+        for pt in self.snake1:
+            pygame.draw.rect(self.display, (0,0,255), pygame.Rect(pt[0], pt[1], BLOCK_SIZE, BLOCK_SIZE))
+            pygame.draw.rect(self.display, (0,100,255), pygame.Rect(pt[0]+4, pt[1]+4, 12, 12))
+        
+        # Draw Snake 2 (Green)
+        for pt in self.snake2:
+            pygame.draw.rect(self.display, (0,255,0), pygame.Rect(pt[0], pt[1], BLOCK_SIZE, BLOCK_SIZE))
+            pygame.draw.rect(self.display, (0,200,0), pygame.Rect(pt[0]+4, pt[1]+4, 12, 12))
+            
+        # Draw Food (Red)
+        pygame.draw.rect(self.display, (200,0,0), pygame.Rect(self.food[0], self.food[1], BLOCK_SIZE, BLOCK_SIZE))
+        
+        # UI Text
+        time_left = max(0, int(GAME_DURATION - (time.time() - self.start_time)))
+        text = self.font.render(f"Time: {time_left}s | P1: {self.score1} | P2: {self.score2}", True, (255, 255, 255))
+        self.display.blit(text, [0, 0])
+        
+        pygame.display.flip()
+
+# ----------------- DQN 模型 / Memory -----------------
+class DQNNet(nn.Module):
+    def __init__(self, input_dim=11, output_dim=3):
+        super(DQNNet, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+class ReplayBuffer:
+    def __init__(self, capacity=MEMORY_SIZE):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.buffer.append(Transition(*args))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return Transition(*zip(*batch))
+
+    def __len__(self):
+        return len(self.buffer)
+
+# ----------------- 獨立 Agent 類別 -----------------
 class Agent:
-    def __init__(self):
-        self.n_games = 0
-        self.epsilon = 0 # 隨機性 (Exploration rate)
-        self.gamma = 0.9 # 折扣因子 (Discount rate) - 重視未來的程度
-        self.learning_rate = 0.1 # 學習率
-        self.q_table = {} # 用字典當作 Q-Table (State -> Actions)
-
-    def get_state_key(self, state):
-        return str(state)
-
-    def get_action(self, state):
-        # 隨機探索 (Epsilon-Greedy)
-        self.epsilon = 80 - self.n_games # 隨著遊戲次數增加，減少隨機亂走
-        final_move = [0,0,0]
+    def __init__(self, input_dim=11):
+        self.policy_net = DQNNet(input_dim).to(DEVICE)
+        self.target_net = DQNNet(input_dim).to(DEVICE)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
         
-        if random.randint(0, 200) < self.epsilon:
-            move = random.randint(0, 2)
-            final_move[move] = 1
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
+        self.memory = ReplayBuffer()
+        
+    def select_action(self, state, eps):
+        if random.random() < eps:
+            return random.randrange(3)
         else:
-            state_key = self.get_state_key(state)
-            if state_key not in self.q_table:
-                self.q_table[state_key] = [0, 0, 0]
-            
-            prediction = self.q_table[state_key]
-            move = np.argmax(prediction)
-            final_move[move] = 1
-            
-        return final_move
+            state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            with torch.no_grad():
+                q = self.policy_net(state_t)
+                return q.max(1)[1].item()
 
-    def train(self, state, action, reward, next_state, done):
-        state_key = self.get_state_key(state)
-        next_state_key = self.get_state_key(next_state)
+    def optimize(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
         
-        if state_key not in self.q_table:
-            self.q_table[state_key] = [0, 0, 0]
-        if next_state_key not in self.q_table:
-            self.q_table[next_state_key] = [0, 0, 0]
+        transitions = self.memory.sample(BATCH_SIZE)
+        batch = Transition(*transitions)
 
-        # Q-Learning 核心公式 (Bellman Equation)
-        # Q_new = Q + lr * (Reward + gamma * max(Q_next) - Q)
-        
-        action_idx = np.argmax(action)
-        old_value = self.q_table[state_key][action_idx]
-        
-        next_max = np.max(self.q_table[next_state_key])
-        
-        # 如果遊戲結束，未來獎勵為 0
-        if done:
-            target = reward
-        else:
-            target = reward + self.gamma * next_max
-            
-        new_value = old_value + self.learning_rate * (target - old_value)
-        
-        # 更新表
-        self.q_table[state_key][action_idx] = new_value
+        # 轉換為 Tensor
+        state_batch = torch.tensor(np.array(batch.state), dtype=torch.float32, device=DEVICE)
+        action_batch = torch.tensor(batch.action, dtype=torch.int64, device=DEVICE).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, dtype=torch.float32, device=DEVICE).unsqueeze(1)
+        next_state_batch = torch.tensor(np.array(batch.next_state), dtype=torch.float32, device=DEVICE)
+        done_batch = torch.tensor(batch.done, dtype=torch.float32, device=DEVICE).unsqueeze(1)
 
-# --- 主程式 ---
-def train():
-    agent = Agent()
-    game = SnakeGameAI()
+        # Q(s, a)
+        q_values = self.policy_net(state_batch).gather(1, action_batch)
+
+        # Target Q = r + gamma * max Q(s', a')
+        with torch.no_grad():
+            next_q_values = self.target_net(next_state_batch).max(1)[0].unsqueeze(1)
+            expected_q_values = reward_batch + (1 - done_batch) * GAMMA * next_q_values
+
+        loss = F.mse_loss(q_values, expected_q_values)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Gradient Clipping 避免梯度爆炸
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        self.optimizer.step()
+
+# ----------------- 訓練主程式 (時間制) -----------------
+def train_timed_dual_dqn():
+    env = MultiSnakeGameAI(render=True)
     
-    # 紀錄最高分
-    record = 0
+    # 建立兩個獨立的 Agent
+    agent1 = Agent()
+    agent2 = Agent()
     
+    # 嘗試載入先前的模型 (可選)
+    if os.path.exists("agent1_dqn.pth"):
+        try:
+            agent1.policy_net.load_state_dict(torch.load("agent1_dqn.pth"))
+            agent1.target_net.load_state_dict(agent1.policy_net.state_dict())
+            print("Loaded Agent 1 model.")
+        except: pass
+    if os.path.exists("agent2_dqn.pth"):
+        try:
+            agent2.policy_net.load_state_dict(torch.load("agent2_dqn.pth"))
+            agent2.target_net.load_state_dict(agent2.policy_net.state_dict())
+            print("Loaded Agent 2 model.")
+        except: pass
+
+    total_steps = 0
+    start_time = time.time()
+    
+    print("Game Started! Duration: 5 Minutes...")
+
+    # 取得初始狀態
+    state1, state2 = env.reset_all()
+
     while True:
-        # 1. 獲取舊狀態
-        state_old = game.get_state()
-        
-        # 2. 決定動作
-        final_move = agent.get_action(state_old)
-        
-        # 3. 執行動作並獲取結果
-        reward, done, score = game.play_step(final_move)
-        state_new = game.get_state()
-        
-        # 4. 訓練 (更新 Q-Table)
-        agent.train(state_old, final_move, reward, state_new, done)
-        
-        if done:
-            game.reset()
-            agent.n_games += 1
+        # 計算經過時間
+        elapsed_time = time.time() - start_time
+        if elapsed_time > GAME_DURATION:
+            print("Time's up! Game Over.")
+            break
             
-            if score > record:
-                record = score
-                # 可以把模型存起來
-                # agent.model.save() 
-            
-            print(f'Game: {agent.n_games}, Score: {score}, Record: {record}')
+        # 計算 Epsilon decay (隨時間減少)
+        # 假設前 4 分鐘 epsilon 從 1.0 降到 0.05
+        progress = min(1.0, elapsed_time / (GAME_DURATION * 0.8))
+        eps = EPS_START - (EPS_START - EPS_END) * progress
 
-if __name__ == '__main__':
-    train()
+        # 1. 選擇動作
+        action1 = agent1.select_action(state1, eps)
+        action2 = agent2.select_action(state2, eps)
+
+        # 2. 執行一步
+        next_state1, next_state2, reward1, reward2, dead1, dead2 = env.play_step(action1, action2)
+
+        # 3. 儲存記憶 (個別儲存)
+        # 注意: 如果 dead=True，這一步對該 Agent 來說是 Done
+        agent1.memory.push(state1, action1, reward1, next_state1, float(dead1))
+        agent2.memory.push(state2, action2, reward2, next_state2, float(dead2))
+
+        # 4. 更新狀態
+        state1 = next_state1
+        state2 = next_state2
+
+        # 5. 訓練模型
+        total_steps += 1
+        if total_steps > TRAIN_START and total_steps % TRAIN_EVERY == 0:
+            agent1.optimize()
+            agent2.optimize()
+
+        # 6. 更新 Target Net
+        if total_steps % TARGET_UPDATE_FREQ == 0:
+            agent1.target_net.load_state_dict(agent1.policy_net.state_dict())
+            agent2.target_net.load_state_dict(agent2.policy_net.state_dict())
+
+        # Debug 資訊 (每 1000 步顯示一次)
+        if total_steps % 1000 == 0:
+            print(f"Time: {int(elapsed_time)}s | Steps: {total_steps} | Score: {env.score1}-{env.score2} | Eps: {eps:.2f}")
+
+    # 結束後儲存
+    torch.save(agent1.policy_net.state_dict(), "agent1_dqn.pth")
+    torch.save(agent2.policy_net.state_dict(), "agent2_dqn.pth")
+    print("Models saved.")
+    pygame.quit()
+
+if __name__ == "__main__":
+    train_timed_dual_dqn()
