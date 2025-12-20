@@ -1,0 +1,10 @@
+services:
+  snake-dqn:
+    build: .
+    container_name: snake_ai
+    volumes:
+      - ./App:/app  # 修正：直接對準 App 資料夾
+    environment:
+      - SDL_VIDEODRIVER=dummy
+    stdin_open: true
+    tty: true

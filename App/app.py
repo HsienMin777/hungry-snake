@@ -463,18 +463,26 @@ def train_timed_dual_dqn():
     agent1 = Agent()
     agent2 = Agent()
     
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 2. 將資料夾路徑與檔名結合
+    # 這會變成 D:\文件\桌面\Coding\side_proj\hungry_snake\App\checkpoint.pth
+    checkpoint_path1 = os.path.join(script_dir, "agent1_dqn.pth")
+    checkpoint_path2 = os.path.join(script_dir, "agent2_dqn.pth")
+    
+
     # 嘗試載入先前的模型 (可選)
-    if os.path.exists("agent1_dqn.pth"):
+    if os.path.exists(checkpoint_path1):
         try:
-            agent1.policy_net.load_state_dict(torch.load("agent1_dqn.pth"))
+            agent1.policy_net.load_state_dict(torch.load(checkpoint_path1, map_location=DEVICE))
             agent1.target_net.load_state_dict(agent1.policy_net.state_dict())
-            print("Loaded Agent 1 model.")
+            print(f"Loaded Agent 1 model from: {checkpoint_path1}")
         except: pass
-    if os.path.exists("agent2_dqn.pth"):
+    if os.path.exists(checkpoint_path2):
         try:
-            agent2.policy_net.load_state_dict(torch.load("agent2_dqn.pth"))
+            agent2.policy_net.load_state_dict(torch.load(checkpoint_path2, map_location=DEVICE))
             agent2.target_net.load_state_dict(agent2.policy_net.state_dict())
-            print("Loaded Agent 2 model.")
+            print(f"Loaded Agent 2 model from: {checkpoint_path2}")
         except: pass
     
     total_steps = 0
